@@ -6,7 +6,7 @@
 # 
 # Supported OSes:
 #
-# Linux (Perl 5.8.8, 5.10.0, 5.12.4, 5.14.1)
+# Linux (Perl 5.8.8, 5.10.0, 5.12.4, 5.14.1, 5.16.3)
 #   i386/x86_64 Linux
 #   ARM Linux
 #   PowerPC Linux
@@ -15,6 +15,8 @@
 #   Under 10.5, builds Universal Binaries for i386/ppc Perl 5.8.8
 #   Under 10.6, builds Universal Binaries for i386/x86_64 Perl 5.10.0
 #   Under 10.7, builds for x86_64 Perl 5.12.3 (Lion does not support 32-bit CPUs)
+#   Under 10.9, builds for x86_64 Perl 5.16
+#   Under 10.10, builds for x86_64 Perl 5.18
 # FreeBSD 7.2 (Perl 5.8.9)
 # FreeBSD 8.X,9.X (Perl 5.12.4)
 #
@@ -31,55 +33,272 @@
 #     perlbrew install perl-5.12.4 -D usethreads -A ccflags=-fno-stack-protector -A ldflags=-fno-stack-protector
 #
 
+# Require modules to pass tests
+RUN_TESTS=1
+USE_HINTS=1
+CLEAN=1
+FLAGS="-fPIC"
+
+function usage {
+    cat <<EOF
+$0 [args] [target]
+-h this help
+-c do not run make clean
+-t do not run tests
+
+target: make target - if not specified all will be built
+
+EOF
+}
+
+while getopts hct opt; do
+  case $opt in
+  c)
+      CLEAN=0
+      ;;
+  t)
+      RUN_TESTS=0
+      ;;
+  h)
+      usage
+      exit
+      ;;
+  *)
+      echo "invalid argument"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+shift $((OPTIND - 1))
+
+echo "RUN_TESTS:$RUN_TESTS CLEAN:$CLEAN USE_HINTS:$USE_HINTS target ${1-all}"
+
 OS=`uname`
 MACHINE=`uname -m`
 
 # get system arch, stripping out extra -gnu on Linux
-ARCH=`/usr/bin/perl -MConfig -le 'print $Config{archname}' | sed 's/gnu-//' | sed 's/^i[3456]86-/i386-/' | sed 's/armv5tejl/arm/' `
+ARCHPERL=/usr/bin/perl
+if [ "$OS" = "FreeBSD" ]; then
+    ARCHPERL=/usr/local/bin/perl
+fi
+ARCH=`$ARCHPERL -MConfig -le 'print $Config{archname}' | sed 's/gnu-//' | sed 's/^i[3456]86-/i386-/' | sed 's/armv.*?-/arm-/' `
 
-if [ $OS = "Linux" -o $OS = "Darwin" -o $OS = "FreeBSD" ]; then
+if [ "$OS" = "Linux" -o "$OS" = "Darwin" -o "$OS" = "FreeBSD" ]; then
     echo "Building for $OS / $ARCH"
 else
     echo "Unsupported platform: $OS, please submit a patch or provide us with access to a development system."
     exit
 fi
 
-if [ ! -x /usr/bin/rsync ]; then
-    echo "This script requires /usr/bin/rsync, please install it."
-    exit
+
+# Set default values prior to potential overwrite for FreeBSD platforms
+GCC=gcc
+GXX=g++
+GPP=cpp
+if [ "$OS" = "FreeBSD" ]; then
+    BSD_MAJOR_VER=`uname -r | sed 's/\..*//g'`
+    BSD_MINOR_VER=`uname -r | sed 's/.*\.//g'`
+    if [ $BSD_MAJOR_VER -ge 11 ]; then
+        if [ -f "/etc/make.conf" ]; then
+           MAKE_CC=`grep CC /etc/make.conf | grep -v CCACHE | grep -v \# | sed 's#CC=##g'`
+           MAKE_CXX=`grep CXX /etc/make.conf | grep -v CCACHE | grep -v \# | sed 's#CXX=##g'`
+           MAKE_CPP=`grep CPP /etc/make.conf | grep -v CCACHE | grep -v \# | sed 's#CPP=##g'`
+        fi
+        if [[ ! -z "$MAKE_CC" ]]; then
+            GCC="$MAKE_CC"
+        elif [ $BSD_MAJOR_VER -ge 10 ]; then
+            # FreeBSD started using clang as the default compiler starting with 10.
+            GCC=cc
+        else
+            GCC=cc
+        fi
+        if [[ ! -z "$MAKE_CXX" ]]; then
+            GXX="$MAKE_CXX"
+        elif [ $BSD_MAJOR_VER -ge 10 ] ; then
+            # FreeBSD started using clang++ as the default compiler starting with 10.
+            GXX=c++
+        else
+            GXX=c++
+        fi
+        if [[ ! -z "$MAKE_CPP" ]]; then
+            GPP="$MAKE_CPP"
+        else
+            GPP=cpp
+        fi
+    fi
+fi
+
+for i in $GCC cpp rsync make rsync ; do
+    which $i > /dev/null
+    if [ $? -ne 0 ] ; then
+        echo "$i not found - please install it"
+        exit 1
+    fi
+done
+
+
+echo "Looks like your compiler is $GCC"
+$GCC --version
+
+# This method works for FreeBSD, with "normal" installs of GCC and clang.
+CC_TYPE=`$GCC --version | head -1`
+
+# Determine compiler type and version
+CC_IS_CLANG=false
+CC_IS_GCC=false
+# This uses bash globbing for the If statement
+if [[ "$CC_TYPE" =~ "clang" ]]; then
+    CLANG_MAJOR=`echo "#include <iostream>" | "$GXX" -xc++ -dM -E - | grep '#define __clang_major' | sed 's/.*__\ //g'`
+    CLANG_MINOR=`echo "#include <iostream>" | "$GXX" -xc++ -dM -E - | grep '#define __clang_minor' | sed 's/.*__\ //g'`
+    CLANG_PATCH=`echo "#include <iostream>" | "$GXX" -xc++ -dM -E - | grep '#define __clang_patchlevel' | sed 's/.*__\ //g'`
+    CC_VERSION=`echo "$CLANG_MAJOR"."$CLANG_MINOR"."$CLANG_PATCH" | sed "s#\ *)\ *##g" | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$/&00/'`
+    CC_IS_CLANG=true
+elif [[ "$CC_TYPE" =~ "gcc" || "$CC_TYPE" =~ "GCC" ]]; then
+    CC_VERSION=`$GCC -dumpversion | sed "s#\ *)\ *##g" | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$/&00/'`
+    CC_IS_GCC=true
+else
+    echo "********************************************** ERROR ***************************************"
+    echo "*"
+    echo "*    You're not using GCC or clang. Somebody's playing a prank on me."
+    echo "*    Cowardly choosing to abandon build."
+    echo "*"
+    echo "********************************************************************************************"
+    exit 1
+fi
+
+if [[ "$CC_IS_GCC" == true && "$CC_VERSION" -lt 40800 ]]; then
+    echo "********************************************** ERROR ****************************************"
+    echo "*"
+    echo "*    It looks like you're using GCC earlier than 4.8,"
+    echo "*    Cowardly choosing to abandon build."
+    echo "*    This is because modern ICU requires -std=c++11"
+    echo "*"
+    echo "********************************************************************************************"
+    exit 1
+fi
+
+if [[ "$CC_IS_CLANG" == true && "$CC_VERSION" -lt 30300 ]]; then
+    echo "********************************************** ERROR ****************************************"
+    echo "*"
+    echo "*    It looks like you're using clang earlier than 3.3,"
+    echo "*    Cowardly choosing to abandon build."
+    echo "*    This is because modern ICU requires -std=c++11"
+    echo "*"
+    echo "********************************************************************************************"
+    exit 1
+fi
+
+if [[ ! -z `echo "#include <iostream>" | "$GXX" -xc++ -dM -E - | grep LIBCPP_VERSION` ]]; then
+    GCC_LIBCPP=true
+elif [[ ! -z `echo "#include <iostream>" | "$GXX" -xc++ -dM -E - | grep __GLIBCXX__` ]]; then
+    GCC_LIBCPP=false
+else
+    echo "********************************************** NOTICE **************************************"
+    echo "*"
+    echo "*    Doesn't seem you're using libc++ or lc++ as your c++ library."
+    echo "*    I will assume you're using the GCC stack, and that DBD needs -lstdc++."
+    echo "*"
+    echo "********************************************************************************************"
+    GCC_LIBCPP=false
+fi
+
+PERL_CC=`$ARCHPERL -V | grep cc=\' | sed "s#.*cc=\'##g" | sed "s#\'.*##g"`
+
+if [[ "$PERL_CC" != "$GCC" ]]; then
+    echo "********************************************** WARNING *************************************"
+    echo "*                                                                                          *"
+    echo "*    Perl was compiled with $PERL_CC,"
+    echo "*    which is different than $GCC."
+    echo "*    This will likely cause significant problems.                                          *"
+    echo "*                                                                                          *"
+    echo "* Press CTRL^C to stop the build now...                                                    *"
+    echo "********************************************************************************************"
+    sleep 3
+fi
+
+which yasm > /dev/null
+if [ $? -ne 0 ] ; then
+    which nasm > /dev/null
+    if [ $? -ne 0 ] ; then
+        echo "please install either yasm or nasm."
+        exit 1
+    fi
+fi
+
+if [ "$OS" = "Linux" ]; then
+	#for i in libgif libz libgd ; do
+	for i in libz libgd ; do
+	    ldconfig -p | grep "${i}.so" > /dev/null
+	    if [ $? -ne 0 ] ; then
+	        echo "$i not found - please install it"
+	        exit 1
+	    fi
+	done
+fi
+
+if [ "$OS" = "FreeBSD" ]; then
+	#for i in libgif libz libgd ; do
+	for i in libz libgd ; do
+	    ldconfig -r | grep "${i}.so" > /dev/null #On FreeBSD flag -r should be used, there is no -p
+	    if [ $? -ne 0 ] ; then
+	        echo "$i not found - please install it"
+	        exit 1
+	    fi
+	done
+fi
+
+find /usr/lib/ -maxdepth 1 | grep libungif
+if [ $? -eq 0 ] ; then
+    echo "ON SOME PLATFORMS (Ubuntu/Debian at least) THE ABOVE LIBRARIES MAY NEED TO BE TEMPORARILY REMOVED TO ALLOW THE BUILD TO WORK"
 fi
 
 # figure out OSX version and customize SDK options
 OSX_VER=
 OSX_FLAGS=
 OSX_ARCH=
-if [ $OS = "Darwin" ]; then
+if [ "$OS" = "Darwin" ]; then
     OSX_VER=`/usr/sbin/system_profiler SPSoftwareDataType`
-    REGEX='Mac OS X.* (10\.[567])'
+    REGEX=' OS X.* (10\.[5-9])'
+    REGEX2=' OS X.* (10\.1[0-9])'
+
     if [[ $OSX_VER =~ $REGEX ]]; then
+        OSX_VER=${BASH_REMATCH[1]}
+    elif [[ $OSX_VER =~ $REGEX2 ]]; then
         OSX_VER=${BASH_REMATCH[1]}
     else
         echo "Unable to determine OSX version"
         exit 0
     fi
     
-    if [ $OSX_VER = "10.5" ]; then
+    if [ "$OSX_VER" = "10.5" ]; then
         # Leopard, build for i386/ppc with support back to 10.4
         OSX_ARCH="-arch i386 -arch ppc"
         OSX_FLAGS="-isysroot /Developer/SDKs/MacOSX10.4u.sdk -mmacosx-version-min=10.4"
-    elif [ $OSX_VER = "10.6" ]; then
+    elif [ "$OSX_VER" = "10.6" ]; then
         # Snow Leopard, build for x86_64/i386 with support back to 10.5
         OSX_ARCH="-arch x86_64 -arch i386"
         OSX_FLAGS="-isysroot /Developer/SDKs/MacOSX10.5.sdk -mmacosx-version-min=10.5"
-    elif [ $OSX_VER = "10.7" ]; then
+    elif [ "$OSX_VER" = "10.7" ]; then
         # Lion, build for x86_64 with support back to 10.6
         OSX_ARCH="-arch x86_64"
         OSX_FLAGS="-isysroot /Developer/SDKs/MacOSX10.6.sdk -mmacosx-version-min=10.6"
+    elif [ "$OSX_VER" = "10.9" ]; then
+        # Mavericks, build for x86_64 with support back to 10.9
+        OSX_ARCH="-arch x86_64"
+        OSX_FLAGS="-mmacosx-version-min=10.9"
+    elif [ "$OSX_VER" = "10.10" ]; then
+        # Yosemite, build for x86_64 with support back to 10.10
+        OSX_ARCH="-arch x86_64"
+        OSX_FLAGS="-mmacosx-version-min=10.10"
     fi
 fi
 
 # Build dir
 BUILD=$PWD/build
+PERL_BASE=$BUILD/perl5x
+PERL_ARCH=$BUILD/arch/perl5x
 
 # Path to Perl 5.8.8
 if [ -x "/usr/bin/perl5.8.8" ]; then
@@ -93,11 +312,9 @@ elif [ -x "/usr/local/bin/perl5.8.9" ]; then # FreeBSD 7.2
 fi
 
 if [ $PERL_58 ]; then
-    echo "Building with Perl 5.8.x at $PERL_58"
+    PERL_BIN=$PERL_58
+    PERL_MINOR_VER=8
 fi
-
-# Install dir for 5.8
-BASE_58=$BUILD/5.8
 
 # Path to Perl 5.10.0
 if [ -x "/usr/bin/perl5.10.0" ]; then
@@ -106,18 +323,17 @@ elif [ -x "/usr/local/bin/perl5.10.0" ]; then
     PERL_510=/usr/local/bin/perl5.10.0
 elif [ -x "/usr/local/bin/perl5.10.1" ]; then # FreeBSD 8.2
     PERL_510=/usr/local/bin/perl5.10.1
-
 fi
 
 if [ $PERL_510 ]; then
-    echo "Building with Perl 5.10 at $PERL_510"
+    PERL_BIN=$PERL_510
+    PERL_MINOR_VER=10
 fi
 
-# Install dir for 5.10
-BASE_510=$BUILD/5.10
-
 # Path to Perl 5.12
-if [ -x "/usr/bin/perl5.12.4" ]; then
+if [ "$OSX_VER" = "10.9" ]; then
+    echo "Ignoring Perl 5.12 - we want 5.16 on Mavericks"
+elif [ -x "/usr/bin/perl5.12.4" ]; then
     PERL_512=/usr/bin/perl5.12.4
 elif [ -x "/usr/local/bin/perl5.12.4" ]; then
     PERL_512=/usr/local/bin/perl5.12.4
@@ -131,11 +347,9 @@ elif [ -x "/usr/bin/perl5.12" ]; then
 fi
 
 if [ $PERL_512 ]; then
-    echo "Building with Perl 5.12 at $PERL_512"
+    PERL_BIN=$PERL_512
+    PERL_MINOR_VER=12
 fi
-
-# Install dir for 5.12
-BASE_512=$BUILD/5.12
 
 # Path to Perl 5.14.1
 if [ -x "$HOME/perl5/perlbrew/perls/perl-5.14.1/bin/perl5.14.1" ]; then
@@ -143,21 +357,91 @@ if [ -x "$HOME/perl5/perlbrew/perls/perl-5.14.1/bin/perl5.14.1" ]; then
 fi
 
 if [ $PERL_514 ]; then
-    echo "Building with Perl 5.14 at $PERL_514"
+    PERL_BIN=$PERL_514
+    PERL_MINOR_VER=14
 fi
 
-# Install dir for 5.14
-BASE_514=$BUILD/5.14
+# Path to Perl 5.16
+if [ "$OSX_VER" = "10.10" ]; then
+    echo "Ignoring Perl 5.16 - we want 5.18 on Yosemite"
+elif [ -x "/usr/bin/perl5.16" ]; then
+    PERL_516=/usr/bin/perl5.16
+elif [ -x "/usr/bin/perl5.16.3" ]; then
+    PERL_516=/usr/bin/perl5.16.3
+fi
 
-# Require modules to pass tests
-RUN_TESTS=1
+if [ $PERL_516 ]; then
+    PERL_BIN=$PERL_516
+    PERL_MINOR_VER=16
+fi
 
-USE_HINTS=1
+# Path to Perl 5.18
+if [ -x "/usr/bin/perl5.18" ]; then
+    PERL_518=/usr/bin/perl5.18
+fi
 
-FLAGS="-fPIC"
+# defined on the command line - no detection yet
+if [ $PERL_518 ]; then
+    PERL_BIN=$PERL_518
+    PERL_MINOR_VER=18
+fi
+
+# defined on the command line - no detection yet
+if [ $PERL_520 ]; then
+    PERL_BIN=$PERL_520
+    PERL_MINOR_VER=20
+fi
+
+# Path to Perl 5.22
+if [ -x "/usr/bin/perl5.22.1" ]; then
+    PERL_522=/usr/bin/perl5.22.1
+fi
+
+if [ $PERL_522 ]; then
+    PERL_BIN=$PERL_522
+    PERL_MINOR_VER=22
+fi
+
+# Path to Perl 5.24
+if [ -x "/usr/bin/perl5.24.1" ]; then
+    PERL_524=/usr/bin/perl5.24.1
+fi
+   
+if [ $PERL_524 ]; then
+    PERL_BIN=$PERL_524
+    PERL_MINOR_VER=24
+fi
+
+# Path to Perl 5.26
+if [ -x "/usr/bin/perl5.26.0" ]; then
+    PERL_526=/usr/bin/perl5.26.0
+fi
+
+if [ $PERL_526 ]; then
+    PERL_BIN=$PERL_526
+    PERL_MINOR_VER=26
+fi
+
+# try to use default perl version
+if [ "$PERL_BIN" = "" ]; then
+    PERL_BIN=`which perl`
+    PERL_VERSION=`perl -MConfig -le '$Config{version} =~ /(\d+.\d+)\./; print $1'`
+    if [[ "$PERL_VERSION" =~ "5." ]]; then
+        PERL_MINOR_VER=`echo "$PERL_VERSION" | sed 's/.*\.//g'`
+    else
+        echo "Failed to find supported Perl version for '$PERL_BIN'"
+        exit
+    fi
+
+fi
+
+echo "Building with Perl 5.$PERL_MINOR_VER at $PERL_BIN"
+PERL_BASE=$BUILD/5.$PERL_MINOR_VER
+PERL_ARCH=$BUILD/arch/5.$PERL_MINOR_VER
+
 
 # FreeBSD's make sucks
-if [ $OS = "FreeBSD" ]; then
+if [ "$OS" = "FreeBSD" ]; then
     if [ ! -x /usr/local/bin/gmake ]; then
         echo "ERROR: Please install GNU make (gmake)"
         exit
@@ -174,32 +458,62 @@ else
 fi
 
 # Clean up
-# XXX command-line flag to skip cleanup
-rm -rf $BUILD/arch
+if [ $CLEAN -eq 1 ]; then
+    rm -rf $BUILD/arch
+fi
 
-mkdir $BUILD
+mkdir -p $PERL_ARCH
+
+# $1 = args
+# $2 = file
+function tar_wrapper {
+    echo "tar $1 $2"
+    tar $1 "$2" > /dev/null
+    echo "tar done"
+}
 
 # $1 = module to build
 # $2 = Makefile.PL arg(s)
+# $3 = run tests if 1 - default to $RUN_TESTS
+# $4 = make clean if 1 - default to $CLEAN
+# $5 = use hints if 1 - default to $USE_HINTS
 function build_module {
-    tar zxvf $1.tar.gz
-    cd $1
-    if [ $USE_HINTS -eq 1 ]; then
+    module=$1
+    makefile_args=$2
+    local_run_tests=${3-$RUN_TESTS}
+    local_clean=${4-$CLEAN}
+    local_use_hints=${5-$USE_HINTS}
+
+    echo "build_module run tests:$local_run_tests clean:$local_clean hints $local_use_hints $module $makefile_args"
+
+    if [ ! -d $module ]; then
+
+        if [ ! -f "${module}.tar.gz" ]; then
+            echo "ERROR: cannot find source code archive ${module}.tar.gz"
+            echo "Please download all source files from http://github.com/Logitech/slimserver-vendor"
+            exit
+        fi
+
+        tar_wrapper zxvf "${module}.tar.gz"
+    fi
+
+    cd "${module}"
+    
+    if [ $local_use_hints -eq 1 ]; then
         # Always copy in our custom hints for OSX
         cp -Rv ../hints .
     fi
-    if [ $PERL_58 ]; then
-        # Running 5.8
-        export PERL5LIB=$BASE_58/lib/perl5
+    if [ $PERL_BIN ]; then
+        export PERL5LIB=$PERL_BASE/lib/perl5
         
-        $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58 $2
-        if [ $RUN_TESTS -eq 1 ]; then
+        $PERL_BIN Makefile.PL INSTALL_BASE=$PERL_BASE $makefile_args
+        if [ $local_run_tests -eq 1 ]; then
             make test
         else
             make
         fi
         if [ $? != 0 ]; then
-            if [ $RUN_TESTS -eq 1 ]; then
+            if [ $local_run_tests -eq 1 ]; then
                 echo "make test failed, aborting"
             else
                 echo "make failed, aborting"
@@ -207,73 +521,14 @@ function build_module {
             exit $?
         fi
         make install
-        make clean
-    fi
-    if [ $PERL_510 ]; then
-        # Running 5.10
-        export PERL5LIB=$BASE_510/lib/perl5
-        
-        $PERL_510 Makefile.PL INSTALL_BASE=$BASE_510 $2
-        if [ $RUN_TESTS -eq 1 ]; then
-            make test
-        else
-            make
-        fi
-        if [ $? != 0 ]; then
-            if [ $RUN_TESTS -eq 1 ]; then
-                echo "make test failed, aborting"
-            else
-                echo "make failed, aborting"
-            fi
-            exit $?
-        fi
-        make install
-        make clean
-    fi
-    if [ $PERL_512 ]; then
-        # Running 5.12
-        export PERL5LIB=$BASE_512/lib/perl5
 
-        $PERL_512 Makefile.PL INSTALL_BASE=$BASE_512 $2
-        if [ $RUN_TESTS -eq 1 ]; then
-            make test
-        else
-            make
+        if [ $local_clean -eq 1 ]; then
+            make clean
         fi
-        if [ $? != 0 ]; then
-            if [ $RUN_TESTS -eq 1 ]; then
-                echo "make test failed, aborting"
-            else
-                echo "make failed, aborting"
-            fi
-            exit $?
-        fi
-        make install
-        make clean
     fi
-    if [ $PERL_514 ]; then
-        # Running 5.14
-        export PERL5LIB=$BASE_514/lib/perl5
 
-        $PERL_514 Makefile.PL INSTALL_BASE=$BASE_514 $2
-        if [ $RUN_TESTS -eq 1 ]; then
-            make test
-        else
-            make
-        fi
-        if [ $? != 0 ]; then
-            if [ $RUN_TESTS -eq 1 ]; then
-                echo "make test failed, aborting"
-            else
-                echo "make failed, aborting"
-            fi
-            exit $?
-        fi
-        make install
-        make clean
-    fi
     cd ..
-    rm -rf $1
+    rm -rf $module
 }
 
 function build_all {
@@ -287,14 +542,13 @@ function build_all {
     build Digest::SHA1
     build EV
     build Encode::Detect
-    build Font::FreeType
     build HTML::Parser
+    # XXX - Image::Scale requires libjpeg-turbo - which requires nasm 2.07 or later (install from http://www.macports.org/)
     build Image::Scale
     build IO::AIO
     build IO::Interface
     build JSON::XS
     build Linux::Inotify2
-    build Locale::Hebrew
     build Mac::FSEvents
     build Media::Scan
     build MP3::Cut::Gapless
@@ -302,19 +556,21 @@ function build_all {
     build Template
     build XML::Parser
     build YAML::LibYAML
+#    build Font::FreeType
+#    build Locale::Hebrew
 }
 
 function build {
     case "$1" in
         Class::C3::XS)
-            if [ $PERL_58 ]; then
-                tar zxvf Class-C3-XS-0.11.tar.gz
+            if [ $PERL_MINOR_VER -eq 8 ]; then
+                tar_wrapper zxvf Class-C3-XS-0.11.tar.gz
                 cd Class-C3-XS-0.11
                 patch -p0 < ../Class-C3-XS-no-ckWARN.patch
                 cp -Rv ../hints .
-                export PERL5LIB=$BASE_58/lib/perl5
+                export PERL5LIB=$PERL_BASE/lib/perl5
 
-                $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58 $2
+                $PERL_BIN Makefile.PL INSTALL_BASE=$PERL_BASE $2
                 if [ $RUN_TESTS -eq 1 ]; then
                     make test
                 else
@@ -329,44 +585,69 @@ function build {
                     exit $?
                 fi
                 make install
-                make clean
+                if [ $CLEAN -eq 1 ]; then
+                    make clean
+                fi
                 cd ..
                 rm -rf Class-C3-XS-0.11
             fi
             ;;
         
         Class::XSAccessor)
-            build_module Class-XSAccessor-1.05
+            if [ $PERL_MINOR_VER -ge 16 ]; then
+                build_module Class-XSAccessor-1.18
+                cp -pR $PERL_BASE/lib/perl5/$ARCH/Class $PERL_ARCH/
+            else
+                if [[ "$CC_IS_CLANG" == true ]]; then
+                    build_module Class-XAccessor-1.18
+                else
+                    build_module Class-XSAccessor-1.05
+                fi
+            fi
             ;;
         
         Compress::Raw::Zlib)
-            build_module Compress-Raw-Zlib-2.033
+            if [ $PERL_MINOR_VER -eq 8 -o $PERL_MINOR_VER -eq 10 ]; then
+	            build_module Compress-Raw-Zlib-2.033
+                    cp -pR $PERL_BASE/lib/perl5/$ARCH/Compress $PERL_ARCH/
+            fi
             ;;
         
         DBI)
-            build_module DBI-1.616
+            if [ $PERL_MINOR_VER -ge 18 ]; then
+                build_module DBI-1.628
+                cp -p $PERL_BASE/lib/perl5/$ARCH/DBI.pm $PERL_ARCH/
+                cp -pR $PERL_BASE/lib/perl5/$ARCH/DBI $PERL_ARCH/
+            else
+                build_module DBI-1.616 "" 0
+            fi
             ;;
         
         DBD::SQLite)
-            RUN_TESTS=0
-            build_module DBI-1.616
-            RUN_TESTS=1
+            if [ $PERL_MINOR_VER -ge 18 ]; then
+                build_module DBI-1.628 "" 0
+            else
+                build_module DBI-1.616 "" 0
+            fi
             
             # build ICU, but only if it doesn't exist in the build dir,
             # because it takes so damn long on slow platforms
             if [ ! -f build/lib/libicudata_s.a ]; then
-                tar zxvf icu4c-4_6-src.tgz
+                tar_wrapper zxvf icu4c-59_1-src.tgz
                 cd icu/source
-                if [ $OS = 'Darwin' ]; then
+                if [ "$OS" = 'Darwin' ]; then
                     ICUFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -DU_USING_ICU_NAMESPACE=0 -DU_CHARSET_IS_UTF8=1" # faster code for native UTF-8 systems
                     ICUOS="MacOSX"
-                elif [ $OS = 'Linux' ]; then
+                elif [ "$OS" = 'Linux' ]; then
                     ICUFLAGS="$FLAGS -DU_USING_ICU_NAMESPACE=0"
                     ICUOS="Linux"
-                elif [ $OS = 'FreeBSD' ]; then
+                elif [ "$OS" = 'FreeBSD' ]; then
                     ICUFLAGS="$FLAGS -DU_USING_ICU_NAMESPACE=0"
                     ICUOS="FreeBSD"
+                    for i in ../../icu59_patches/freebsd/patch-*;
+                    do patch -p0 < $i; done
                 fi
+                CC="$GCC" CXX="$GXX" CPP="$GPP" \
                 CFLAGS="$ICUFLAGS" CXXFLAGS="$ICUFLAGS" LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" \
                     ./runConfigureICU $ICUOS --prefix=$BUILD --enable-static --with-data-packaging=archive
                 $MAKE
@@ -381,12 +662,6 @@ function build {
 
                 # Symlink static versions of libraries
                 cd build/lib
-                if [ $OS = 'FreeBSD' ]; then
-                    # FreeBSD has different library names (?)
-                    ln -sf libsicudata.a libicudata.a
-                    ln -sf libsicui18n.a libicui18n.a
-                    ln -sf libsicuuc.a libicuuc.a
-                fi
             
                 ln -sf libicudata.a libicudata_s.a
                 ln -sf libicui18n.a libicui18n_s.a
@@ -395,26 +670,32 @@ function build {
             fi
             
             # Point to data directory for test suite
-            export ICU_DATA=$BUILD/share/icu/4.6
+            export ICU_DATA=$BUILD/share/icu/59.1
             
             # Replace huge data file with smaller one containing only our collations
-            rm -f $BUILD/share/icu/4.6/icudt46*.dat
-            cp -v icudt46*.dat $BUILD/share/icu/4.6
+            rm -f $BUILD/share/icu/59.1/icudt59*.dat
+            cp -v icudt59*.dat $BUILD/share/icu/59.1
             
             # Custom build for ICU support
-            tar zxvf DBD-SQLite-1.34_01.tar.gz
+            tar_wrapper zxvf DBD-SQLite-1.34_01.tar.gz
             cd DBD-SQLite-1.34_01
-            patch -p0 < ../DBD-SQLite-ICU.patch
+            if [[ "$GCC_LIBCPP" == true ]]; then
+            # Need this because GLIBCXX uses -lstdc++, but LIBCPP uses -lc++
+                patch -p0 < ../DBD-SQLite-ICU-libcpp.patch
+            else
+                patch -p0 < ../DBD-SQLite-ICU.patch
+            fi
             cp -Rv ../hints .
-            if [ $PERL_58 ]; then
+            
+            if [ $PERL_MINOR_VER -eq 8 ]; then
                 # Running 5.8
-                export PERL5LIB=$BASE_58/lib/perl5
+                export PERL5LIB=$PERL_BASE/lib/perl5
 
-                $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58 $2
+                $PERL_BIN Makefile.PL INSTALL_BASE=$PERL_BASE $2
 
-                if [ $OS = 'Darwin' ]; then
+                if [ "$OS" = 'Darwin' ]; then
                     # OSX does not seem to properly find -lstdc++, so we need to hack the Makefile to add it
-                    $PERL_58 -p -i -e "s{^LDLOADLIBS =.+}{LDLOADLIBS = -L$PWD/../build/lib -licudata_s -licui18n_s -licuuc_s -lstdc++}" Makefile
+                    $PERL_BIN -p -i -e "s{^LDLOADLIBS =.+}{LDLOADLIBS = -L$PWD/../build/lib -licudata_s -licui18n_s -licuuc_s -lstdc++}" Makefile
                 fi
 
                 $MAKE test
@@ -423,50 +704,21 @@ function build {
                     exit $?
                 fi
                 $MAKE install
-                $MAKE clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                export PERL5LIB=$BASE_510/lib/perl5
-
-                $PERL_510 Makefile.PL INSTALL_BASE=$BASE_510 $2
-                make test
-                if [ $? != 0 ]; then
-                    echo "make test failed, aborting"
-                    exit $?
+                if [ $CLEAN -eq 1 ]; then
+                    $MAKE clean
                 fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                export PERL5LIB=$BASE_512/lib/perl5
-
-                $PERL_512 Makefile.PL INSTALL_BASE=$BASE_512 $2
-                make test
-                if [ $? != 0 ]; then
-                    echo "make test failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                export PERL5LIB=$BASE_514/lib/perl5
-
-                $PERL_514 Makefile.PL INSTALL_BASE=$BASE_514 $2
-                make test
-                if [ $? != 0 ]; then
-                    echo "make test failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
+    
+                cd ..
+                rm -rf DBD-SQLite-1.34_01
+            else
+                cd ..
+                if [ $PERL_MINOR_VER -ge 16 ]; then
+                   build_module DBD-SQLite-1.34_01 "" 0
+                else
+		   build_module DBD-SQLite-1.34_01
+		fi
             fi
             
-            cd ..
-            rm -rf DBD-SQLite-1.34_01
             ;;
         
         Digest::SHA1)
@@ -479,111 +731,26 @@ function build {
             # custom build to apply pthread patch
             export PERL_MM_USE_DEFAULT=1
             
-            tar zxvf EV-4.03.tar.gz
+            tar_wrapper zxvf EV-4.03.tar.gz
             cd EV-4.03
             patch -p0 < ../EV-llvm-workaround.patch # patch to avoid LLVM bug 9891
-            if [ $OS = "Darwin" ]; then
+            if [ "$OS" = "Darwin" ]; then
                 if [ $PERL_58 ]; then
                     patch -p0 < ../EV-fixes.patch # patch to disable pthreads and one call to SvREADONLY
                 fi
             fi
             cp -Rv ../hints .
-            if [ $PERL_58 ]; then
-                # Running 5.8
-                export PERL5LIB=$BASE_58/lib/perl5
-
-                $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58 $2
-                if [ $RUN_TESTS -eq 1 ]; then
-                    make test
-                else
-                    make
-                fi
-                if [ $? != 0 ]; then
-                    if [ $RUN_TESTS -eq 1 ]; then
-                        echo "make test failed, aborting"
-                    else
-                        echo "make failed, aborting"
-                    fi
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                export PERL5LIB=$BASE_510/lib/perl5
-
-                $PERL_510 Makefile.PL INSTALL_BASE=$BASE_510 $2
-                if [ $RUN_TESTS -eq 1 ]; then
-                    make test
-                else
-                    make
-                fi
-                if [ $? != 0 ]; then
-                    if [ $RUN_TESTS -eq 1 ]; then
-                        echo "make test failed, aborting"
-                    else
-                        echo "make failed, aborting"
-                    fi
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                export PERL5LIB=$BASE_512/lib/perl5
-
-                $PERL_512 Makefile.PL INSTALL_BASE=$BASE_512 $2
-                if [ $RUN_TESTS -eq 1 ]; then
-                    make test
-                else
-                    make
-                fi
-                if [ $? != 0 ]; then
-                    if [ $RUN_TESTS -eq 1 ]; then
-                        echo "make test failed, aborting"
-                    else
-                        echo "make failed, aborting"
-                    fi
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                export PERL5LIB=$BASE_514/lib/perl5
-
-                $PERL_514 Makefile.PL INSTALL_BASE=$BASE_514 $2
-                if [ $RUN_TESTS -eq 1 ]; then
-                    make test
-                else
-                    make
-                fi
-                if [ $? != 0 ]; then
-                    if [ $RUN_TESTS -eq 1 ]; then
-                        echo "make test failed, aborting"
-                    else
-                        echo "make failed, aborting"
-                    fi
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
             cd ..
-            rm -rf EV-4.03
             
+            build_module EV-4.03
+
             export PERL_MM_USE_DEFAULT=
             ;;
         
         Encode::Detect)
             build_module Data-Dump-1.19
             build_module ExtUtils-CBuilder-0.260301
-            RUN_TESTS=0
-            build_module Module-Build-0.35
-            RUN_TESTS=1
+            build_module Module-Build-0.35 "" 0
             build_module Encode-Detect-1.00
             ;;
         
@@ -598,126 +765,57 @@ function build {
             build_giflib
             
             # build Image::Scale
-            RUN_TESTS=0
-            build_module Test-NoWarnings-1.02
-            RUN_TESTS=1
-            
-            tar zxvf Image-Scale-0.08.tar.gz
-            cd Image-Scale-0.08
+            build_module Test-NoWarnings-1.02 "" 0
+
+            tar_wrapper zxvf Image-Scale-0.11.tar.gz
+            cd Image-Scale-0.11
+
+            if [[ "$OS" = "FreeBSD" && "$PERL_MINOR_VER" -ge 22 ]]; then
+                mkdir -p $PERL_ARCH/$ARCH
+                cp -Rv lib/Image $PERL_ARCH/$ARCH/
+            fi
+
             cp -Rv ../hints .
-            if [ $PERL_58 ]; then
-                # Running 5.8
-                $PERL_58 Makefile.PL --with-jpeg-includes="$BUILD/include" --with-jpeg-static \
-                    --with-png-includes="$BUILD/include" --with-png-static \
-                    --with-gif-includes="$BUILD/include" --with-gif-static \
-                    INSTALL_BASE=$BASE_58
-
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make test
-                
-                # Also test under PPC mode on OSX 10.5
-                if [ $OS = "Darwin" ]; then
-                    arch -ppc prove -Iblib/lib -Iblib/arch t/*.t
-                    if [ $? != 0 ]; then
-                        echo "PPC make test failed, aborting"
-                        exit $?
-                    fi
-                fi
-                
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                $PERL_510 Makefile.PL --with-jpeg-includes="$BUILD/include" --with-jpeg-static \
-                    --with-png-includes="$BUILD/include" --with-png-static \
-                    --with-gif-includes="$BUILD/include" --with-gif-static \
-                    INSTALL_BASE=$BASE_510
-
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make test
-                
-                # Also test in 32-bit mode on OSX 10.6
-                if [ $OS = "Darwin" ]; then
-                    VERSIONER_PERL_PREFER_32_BIT=yes make test
-                    if [ $? != 0 ]; then
-                        echo "32-bit make test failed, aborting"
-                        exit $?
-                    fi
-                fi
-                
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                $PERL_512 Makefile.PL --with-jpeg-includes="$BUILD/include" --with-jpeg-static \
-                    --with-png-includes="$BUILD/include" --with-png-static \
-                    --with-gif-includes="$BUILD/include" --with-gif-static \
-                    INSTALL_BASE=$BASE_512
-            
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make test
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                $PERL_514 Makefile.PL --with-jpeg-includes="$BUILD/include" --with-jpeg-static \
-                    --with-png-includes="$BUILD/include" --with-png-static \
-                    --with-gif-includes="$BUILD/include" --with-gif-static \
-                    INSTALL_BASE=$BASE_514
-            
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make test
-                make install
-                make clean
-            fi
             cd ..
             
-            rm -rf Image-Scale-0.08
+            build_module Image-Scale-0.11 "--with-jpeg-includes="$BUILD/include" --with-jpeg-static \
+                    --with-png-includes="$BUILD/include" --with-png-static \
+                    --with-gif-includes="$BUILD/include" --with-gif-static \
+                    INSTALL_BASE=$PERL_BASE"
+            
             ;;
         
         IO::AIO)
-            if [ $OS != "FreeBSD" ]; then
+            if [ "$OS" != "FreeBSD" ]; then
                 build_module common-sense-2.0
             
                 # Don't use the darwin hints file, it breaks if compiled on Snow Leopard with 10.5 (!?)
-                USE_HINTS=0
-                RUN_TESTS=0
-                build_module IO-AIO-3.71
-                RUN_TESTS=1
-                USE_HINTS=1
+                build_module IO-AIO-3.71 "" 0 $CLEAN 0
             fi
             ;;
         
         IO::Interface)
-            build_module IO-Interface-1.06
+            # The IO::Interface tests erroneously require that lo0 be 127.0.0.1. This can be tough in jails.
+            if [[ "$OS" == "FreeBSD" && `sysctl -n security.jail.jailed` == 1 ]]; then
+                build_module IO-Interface-1.06 "" 0
+            else
+                build_module IO-Interface-1.06
+            fi
             ;;
         
         JSON::XS)
             build_module common-sense-2.0
-            build_module JSON-XS-2.3
+            
+            if [ $PERL_MINOR_VER -ge 18 ]; then
+                build_module JSON-XS-2.34
+                cp -pR $PERL_BASE/lib/perl5/$ARCH/JSON $PERL_ARCH/
+            else
+                build_module JSON-XS-2.3
+            fi
             ;;
         
         Linux::Inotify2)
-            if [ $OS = "Linux" ]; then
+            if [ "$OS" = "Linux" ]; then
                 build_module common-sense-2.0
                 build_module Linux-Inotify2-1.21
             fi
@@ -728,10 +826,8 @@ function build {
             ;;
 
         Mac::FSEvents)
-            if [ $OS = 'Darwin' ]; then
-                RUN_TESTS=0
-                build_module Mac-FSEvents-0.04
-                RUN_TESTS=1
+            if [ "$OS" = 'Darwin' ]; then
+                build_module Mac-FSEvents-0.04 "" 0
             fi
             ;;
         
@@ -740,16 +836,21 @@ function build {
             ;;
         
         YAML::LibYAML)
-            build_module YAML-LibYAML-0.35
+            # Needed because LibYAML 0.35 used . in @INC (not permitted in Perl 5.26)
+            if [ $PERL_MINOR_VER -ge 26 ]; then
+                build_module YAML-LibYAML-0.65
+            elif [ $PERL_MINOR_VER -ge 16 ]; then
+                build_module YAML-LibYAML-0.35 "" 0
+            else
+                build_module YAML-LibYAML-0.35
+            fi
             ;;
         
         Audio::Scan)
-            RUN_TESTS=0
-            build_module Sub-Uplevel-0.22
-            build_module Tree-DAG_Node-1.06
-            build_module Test-Warn-0.23
-            RUN_TESTS=1
-            build_module Audio-Scan-0.93
+            build_module Sub-Uplevel-0.22 "" 0
+            build_module Tree-DAG_Node-1.06 "" 0
+            build_module Test-Warn-0.23 "" 0
+            build_module Audio-Scan-0.95
             ;;
 
         MP3::Cut::Gapless)
@@ -759,61 +860,20 @@ function build {
         
         Template)
             # Template, custom build due to 2 Makefile.PL's
-            tar zxvf Template-Toolkit-2.21.tar.gz
+            tar_wrapper zxvf Template-Toolkit-2.21.tar.gz
             cd Template-Toolkit-2.21
             cp -Rv ../hints .
             cp -Rv ../hints ./xs
-            if [ $PERL_58 ]; then
-                # Running 5.8
-                $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58 TT_ACCEPT=y TT_EXAMPLES=n TT_EXTRAS=n
-                make # minor test failure, so don't test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                $PERL_510 Makefile.PL INSTALL_BASE=$BASE_510 TT_ACCEPT=y TT_EXAMPLES=n TT_EXTRAS=n
-                make # minor test failure, so don't test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                $PERL_512 Makefile.PL INSTALL_BASE=$BASE_512 TT_ACCEPT=y TT_EXAMPLES=n TT_EXTRAS=n
-                make # minor test failure, so don't test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                $PERL_514 Makefile.PL INSTALL_BASE=$BASE_514 TT_ACCEPT=y TT_EXAMPLES=n TT_EXTRAS=n
-                make # minor test failure, so don't test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
             cd ..
-            rm -rf Template-Toolkit-2.21
+
+            $MAKE # minor test failure, so don't test
+            build_module Template-Toolkit-2.21 "INSTALL_BASE=$PERL_BASE TT_ACCEPT=y TT_EXAMPLES=n TT_EXTRAS=n" 0
+
             ;;
         
         DBD::mysql)
             # Build libmysqlclient
-            tar jxvf mysql-5.1.37.tar.bz2
+            tar_wrapper jxvf mysql-5.1.37.tar.bz2
             cd mysql-5.1.37
             CC=gcc CXX=gcc \
             CFLAGS="-O3 -fno-omit-frame-pointer $FLAGS $OSX_ARCH $OSX_FLAGS" \
@@ -822,91 +882,42 @@ function build {
                 --disable-dependency-tracking \
                 --enable-thread-safe-client \
                 --without-server --disable-shared --without-docs --without-man
-            make
+            $MAKE
             if [ $? != 0 ]; then
                 echo "make failed"
                 exit $?
             fi
-            make install
+            $MAKE install
             cd ..
             rm -rf mysql-5.1.37
 
             # DBD::mysql custom, statically linked with libmysqlclient
-            tar zxvf DBD-mysql-3.0002.tar.gz
+            tar_wrapper zxvf DBD-mysql-3.0002.tar.gz
             cd DBD-mysql-3.0002
             cp -Rv ../hints .
             mkdir mysql-static
             cp $BUILD/lib/mysql/libmysqlclient.a mysql-static
-            if [ $PERL_58 ]; then
-                # Running 5.8
-                export PERL5LIB=$BASE_58/lib/perl5
-                
-                $PERL_58 Makefile.PL --mysql_config=$BUILD/bin/mysql_config --libs="-Lmysql-static -lmysqlclient -lz -lm" INSTALL_BASE=$BASE_58 
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                export PERL5LIB=$BASE_510/lib/perl5
-                
-                $PERL_510 Makefile.PL --mysql_config=$BUILD/bin/mysql_config --libs="-Lmysql-static -lmysqlclient -lz -lm" INSTALL_BASE=$BASE_510
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                export PERL5LIB=$BASE_512/lib/perl5
-
-                $PERL_512 Makefile.PL --mysql_config=$BUILD/bin/mysql_config --libs="-Lmysql-static -lmysqlclient -lz -lm" INSTALL_BASE=$BASE_512
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                export PERL5LIB=$BASE_514/lib/perl5
-
-                $PERL_514 Makefile.PL --mysql_config=$BUILD/bin/mysql_config --libs="-Lmysql-static -lmysqlclient -lz -lm" INSTALL_BASE=$BASE_514
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
             cd ..
-            rm -rf DBD-mysql-3.0002
+            
+            build_module DBD-mysql-3.0002 "--mysql_config=$BUILD/bin/mysql_config --libs=\"-Lmysql-static -lmysqlclient -lz -lm\" INSTALL_BASE=$PERL_BASE"
+            
             ;;
         
         XML::Parser)
             # build expat
-            tar zxvf expat-2.0.1.tar.gz
+            tar_wrapper zxvf expat-2.0.1.tar.gz
             cd expat-2.0.1
+            CC="$GCC" CXX="$GXX" CPP="$GPP" \
             CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" \
             LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" \
                 ./configure --prefix=$BUILD \
                 --disable-dependency-tracking
-            make
+            $MAKE
             if [ $? != 0 ]; then
                 echo "make failed"
                 exit $?
             fi
-            make install
+            $MAKE install
             cd ..
 
             # Symlink static versions of libraries to avoid OSX linker choosing dynamic versions
@@ -915,63 +926,22 @@ function build {
             cd ../..
 
             # XML::Parser custom, built against expat
-            tar zxvf XML-Parser-2.41.tar.gz
+            tar_wrapper zxvf XML-Parser-2.41.tar.gz
             cd XML-Parser-2.41
             cp -Rv ../hints .
             cp -Rv ../hints ./Expat # needed for second Makefile.PL
             patch -p0 < ../XML-Parser-Expat-Makefile.patch
-            if [ $PERL_58 ]; then
-                # Running 5.8
-                $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58 EXPATLIBPATH=$BUILD/lib EXPATINCPATH=$BUILD/include
-                make test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                $PERL_510 Makefile.PL INSTALL_BASE=$BASE_510 EXPATLIBPATH=$BUILD/lib EXPATINCPATH=$BUILD/include
-                make test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                $PERL_512 Makefile.PL INSTALL_BASE=$BASE_512 EXPATLIBPATH=$BUILD/lib EXPATINCPATH=$BUILD/include
-                make test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                $PERL_514 Makefile.PL INSTALL_BASE=$BASE_514 EXPATLIBPATH=$BUILD/lib EXPATINCPATH=$BUILD/include
-                make test
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
+            
             cd ..
-            rm -rf XML-Parser-2.41
+            
+            build_module XML-Parser-2.41 "INSTALL_BASE=$PERL_BASE EXPATLIBPATH=$BUILD/lib EXPATINCPATH=$BUILD/include"
+            
             rm -rf expat-2.0.1
             ;;
         
         Font::FreeType)
             # build freetype
-            tar zxvf freetype-2.4.2.tar.gz
+            tar_wrapper zxvf freetype-2.4.2.tar.gz
             cd freetype-2.4.2
             
             # Disable features we don't need for CODE2000
@@ -984,6 +954,7 @@ function build {
             #   1634288 (default)
             #    461984 (with custom ftoption.h/modules.cfg)
             
+            CC="$GCC" CXX="$GXX" CPP="$GPP" \
             CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" \
             LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" \
                 ./configure --prefix=$BUILD
@@ -1000,7 +971,7 @@ function build {
             ln -sf libfreetype.a libfreetype_s.a
             cd ../..
 
-            tar zxvf Font-FreeType-0.03.tar.gz
+            tar_wrapper zxvf Font-FreeType-0.03.tar.gz
             cd Font-FreeType-0.03
             
             # Build statically
@@ -1010,57 +981,10 @@ function build {
             patch -p0 < ../Font-FreeType-lean.patch
             
             cp -Rv ../hints .
-            if [ $PERL_58 ]; then
-                # Running 5.8
-                $PERL_58 Makefile.PL INSTALL_BASE=$BASE_58
-
-                make # tests fail
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                $PERL_510 Makefile.PL INSTALL_BASE=$BASE_510
-
-                make 
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                $PERL_512 Makefile.PL INSTALL_BASE=$BASE_512
-                
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                $PERL_514 Makefile.PL INSTALL_BASE=$BASE_514
-                
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-
             cd ..
-            rm -rf Font-FreeType-0.03
+            
+            build_module Font-FreeType-0.03
+            
             rm -rf freetype-2.4.2
             ;;
         
@@ -1075,18 +999,29 @@ function build {
             # build libmediascan
             # XXX library does not link correctly on Darwin with libjpeg due to missing x86_64
             # in libjpeg.dylib, Perl still links OK because it uses libjpeg.a
-            tar zxvf libmediascan-0.1.tar.gz
+            tar_wrapper zxvf libmediascan-0.1.tar.gz
+
+            if [ "$OSX_VER" = "10.9" -o "$OSX_VER" = "10.10" ]; then
+                patch -p0 libmediascan-0.1/bindings/perl/hints/darwin.pl < libmediascan-hints-darwin.pl.patch
+            fi
+
             cd libmediascan-0.1
+
+			if [ "$OS" = "FreeBSD" ]; then
+            	patch -p1 < ../libmediascan-freebsd.patch
+            fi
+
+            CC="$GCC" CXX="$GXX" CPP="$GPP" \
             CFLAGS="-I$BUILD/include $FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
             LDFLAGS="-L$BUILD/lib $FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
             OBJCFLAGS="-L$BUILD/lib $FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
                 ./configure --prefix=$BUILD --disable-shared --disable-dependency-tracking
-            make
+            $MAKE
             if [ $? != 0 ]; then
                 echo "make failed"
                 exit $?
             fi            
-            make install
+            $MAKE install
             cd ..
 
             # build Media::Scan
@@ -1102,72 +1037,23 @@ function build {
                 --with-gif-includes=$BUILD/include \
                 --with-bdb-includes=$BUILD/include"
                 
-            if [ $PERL_58 ]; then
-                $PERL_58 Makefile.PL $MSOPTS INSTALL_BASE=$BASE_58
-                make
+            if [ $PERL_BIN ]; then
+                $PERL_BIN Makefile.PL $MSOPTS INSTALL_BASE=$PERL_BASE
+                $MAKE
                 if [ $? != 0 ]; then
                     echo "make failed, aborting"
                     exit $?
                 fi
                 # XXX hack until regular test works
-                $PERL_58 -Iblib/lib -Iblib/arch t/01use.t
+                $PERL_BIN -Iblib/lib -Iblib/arch t/01use.t
                 if [ $? != 0 ]; then
                     echo "make test failed, aborting"
                     exit $?
                 fi
-                make install
-                make clean
-            fi
-            if [ $PERL_510 ]; then
-                # Running 5.10
-                $PERL_510 Makefile.PL $MSOPTS INSTALL_BASE=$BASE_510
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
+                $MAKE install
+                if [ $CLEAN -eq 1 ]; then
+                    $MAKE clean
                 fi
-                # XXX hack until regular test works
-                $PERL_510 -Iblib/lib -Iblib/arch t/01use.t
-                if [ $? != 0 ]; then
-                    echo "make test failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_512 ]; then
-                # Running 5.12
-                $PERL_512 Makefile.PL $MSOPTS INSTALL_BASE=$BASE_512
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                # XXX hack until regular test works
-                $PERL_512 -Iblib/lib -Iblib/arch t/01use.t
-                if [ $? != 0 ]; then
-                    echo "make test failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
-            fi
-            if [ $PERL_514 ]; then
-                # Running 5.14
-                $PERL_514 Makefile.PL $MSOPTS INSTALL_BASE=$BASE_514
-                make
-                if [ $? != 0 ]; then
-                    echo "make failed, aborting"
-                    exit $?
-                fi
-                # XXX hack until regular test works
-                $PERL_514 -Iblib/lib -Iblib/arch t/01use.t
-                if [ $? != 0 ]; then
-                    echo "make test failed, aborting"
-                    exit $?
-                fi
-                make install
-                make clean
             fi
             
             cd ../../..
@@ -1182,9 +1068,10 @@ function build_libexif {
     fi
     
     # build libexif
-    tar jxvf libexif-0.6.20.tar.bz2
+    tar_wrapper jxvf libexif-0.6.20.tar.bz2
     cd libexif-0.6.20
     
+    CC="$GCC" CXX="$GXX" CPP="$GPP" \
     CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
     LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
         ./configure --prefix=$BUILD \
@@ -1206,21 +1093,23 @@ function build_libjpeg {
     fi
     
     # build libjpeg-turbo on x86 platforms
-    if [ $OS = "Darwin" -a $OSX_VER != "10.5" ]; then
+    # skip on 10.9 until we've been able to build nasm from macports
+    if [ "$OS" = "Darwin" -a "$OSX_VER" != "10.5" ]; then
         # Build i386/x86_64 versions of turbo
-        tar zxvf libjpeg-turbo-1.1.1.tar.gz
+        tar_wrapper zxvf libjpeg-turbo-1.1.1.tar.gz
         cd libjpeg-turbo-1.1.1
         
         # Disable features we don't need
         cp -fv ../libjpeg-turbo-jmorecfg.h jmorecfg.h
         
         # Build 64-bit fork
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="-O3 $OSX_FLAGS" \
         CXXFLAGS="-O3 $OSX_FLAGS" \
         LDFLAGS="$OSX_FLAGS" \
             ./configure --prefix=$BUILD --host x86_64-apple-darwin NASM=/usr/local/bin/nasm \
             --disable-dependency-tracking
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
@@ -1228,13 +1117,16 @@ function build_libjpeg {
         cp -fv .libs/libjpeg.a libjpeg-x86_64.a
         
         # Build 32-bit fork
-        make clean
+        if [ $CLEAN -eq 1 ]; then
+            make clean
+        fi
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="-O3 -m32 $OSX_FLAGS" \
         CXXFLAGS="-O3 -m32 $OSX_FLAGS" \
         LDFLAGS="-m32 $OSX_FLAGS" \
             ./configure --prefix=$BUILD NASM=/usr/local/bin/nasm \
             --disable-dependency-tracking
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
@@ -1245,46 +1137,48 @@ function build_libjpeg {
         lipo -create libjpeg-x86_64.a libjpeg-i386.a -output libjpeg.a
         
         # Install and replace libjpeg.a with universal version
-        make install
+        $MAKE install
         cp -f libjpeg.a $BUILD/lib/libjpeg.a
         cd ..
     
-    elif [ $OS = "Darwin" -a $OSX_VER = "10.5" ]; then
+    elif [ "$OS" = "Darwin" -a "$OSX_VER" = "10.5" ]; then
         # combine i386 turbo with ppc libjpeg
         
         # build i386 turbo
-        tar zxvf libjpeg-turbo-1.1.1.tar.gz
+        tar_wrapper zxvf libjpeg-turbo-1.1.1.tar.gz
         cd libjpeg-turbo-1.1.1
         
         # Disable features we don't need
         cp -fv ../libjpeg-turbo-jmorecfg.h jmorecfg.h
         
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="-O3 -m32 $OSX_FLAGS" \
         CXXFLAGS="-O3 -m32 $OSX_FLAGS" \
         LDFLAGS="-m32 $OSX_FLAGS" \
             ./configure --prefix=$BUILD NASM=/usr/local/bin/nasm \
             --disable-dependency-tracking
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
         fi
-        make install
+        $MAKE install
         cp -fv .libs/libjpeg.a ../libjpeg-i386.a
         cd ..
         
         # build ppc libjpeg 6b
-        tar zxvf jpegsrc.v6b.tar.gz
+        tar_wrapper zxvf jpegsrc.v6b.tar.gz
         cd jpeg-6b
         
         # Disable features we don't need
         cp -fv ../libjpeg62-jmorecfg.h jmorecfg.h
         
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="-arch ppc -O3 $OSX_FLAGS" \
         LDFLAGS="-arch ppc -O3 $OSX_FLAGS" \
             ./configure --prefix=$BUILD \
             --disable-dependency-tracking
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
@@ -1299,43 +1193,45 @@ function build_libjpeg {
         mv -fv libjpeg.a $BUILD/lib/libjpeg.a
         rm -fv libjpeg-i386.a libjpeg-ppc.a
         
-    elif [ $ARCH = "i386-linux-thread-multi" -o $ARCH = "x86_64-linux-thread-multi" -o $OS = "FreeBSD" ]; then
+    elif [ "$ARCH" = "i386-linux-thread-multi" -o "$ARCH" = "x86_64-linux-thread-multi" -o "$OS" = "FreeBSD" ]; then
         # build libjpeg-turbo
-        tar zxvf libjpeg-turbo-1.1.1.tar.gz
+        tar_wrapper zxvf libjpeg-turbo-1.1.1.tar.gz
         cd libjpeg-turbo-1.1.1
         
         # Disable features we don't need
         cp -fv ../libjpeg-turbo-jmorecfg.h jmorecfg.h
-        
+
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" CXXFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS" \
             ./configure --prefix=$BUILD --disable-dependency-tracking
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
         fi
         
-        make install
+        $MAKE install
         cd ..
         
     # build libjpeg v8 on other platforms
     else
-        tar zxvf jpegsrc.v8b.tar.gz
+        tar_wrapper zxvf jpegsrc.v8b.tar.gz
         cd jpeg-8b
         
         # Disable features we don't need
         cp -fv ../libjpeg-jmorecfg.h jmorecfg.h
         
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
         LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
             ./configure --prefix=$BUILD \
             --disable-dependency-tracking
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
         fi
-        make install
+        $MAKE install
         cd ..
     fi
     
@@ -1350,22 +1246,23 @@ function build_libpng {
     fi
     
     # build libpng
-    tar zxvf libpng-1.4.3.tar.gz
+    tar_wrapper zxvf libpng-1.4.3.tar.gz
     cd libpng-1.4.3
     
     # Disable features we don't need
     cp -fv ../libpng-pngconf.h pngconf.h
     
+    CC="$GCC" CXX="$GXX" CPP="$GPP" \
     CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
     LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
         ./configure --prefix=$BUILD \
         --disable-dependency-tracking
-    make && make check
+    $MAKE && $MAKE check
     if [ $? != 0 ]; then
         echo "make failed"
         exit $?
     fi
-    make install
+    $MAKE install
     cd ..
     
     rm -rf libpng-1.4.3
@@ -1377,33 +1274,36 @@ function build_giflib {
     fi
     
     # build giflib
-    tar zxvf giflib-4.1.6.tar.gz
+    tar_wrapper zxvf giflib-4.1.6.tar.gz
     cd giflib-4.1.6
+    CC="$GCC" CXX="$GXX" CPP="$GPP" \
     CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
     LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
         ./configure --prefix=$BUILD \
         --disable-dependency-tracking
-    make
+    $MAKE
     if [ $? != 0 ]; then
         echo "make failed"
         exit $?
     fi
-    make install
+    $MAKE install
     cd ..
     
     rm -rf giflib-4.1.6
 }
 
 function build_ffmpeg {
+    echo "build ffmpeg"
     if [ -f $BUILD/include/libavformat/avformat.h ]; then
+        echo "found avformat.h - returning"
         return
     fi
     
     # build ffmpeg, enabling only the things libmediascan uses
-    tar jxvf ffmpeg-0.8.4.tar.bz2
+    tar_wrapper jxvf ffmpeg-0.8.4.tar.bz2
     cd ffmpeg-0.8.4
     
-    if [ $MACHINE = "padre" ]; then
+    if [ "$MACHINE" = "padre" ]; then
         patch -p0 < ../ffmpeg-padre-configure.patch
     fi
     
@@ -1439,25 +1339,31 @@ function build_ffmpeg {
     
     # ASM doesn't work right on x86_64
     # XXX test --arch options on Linux
-    if [ $ARCH = "x86_64-linux-thread-multi" ]; then
+    if [ "$ARCH" = "x86_64-linux-thread-multi" -o "$ARCH" = "amd64-freebsd-thread-multi" ]; then
         FFOPTS="$FFOPTS --disable-mmx"
     fi
     # FreeBSD amd64 needs arch option
-    if [ $ARCH = "amd64-freebsd" ]; then
-	FFOPTS="$FFOPTS --arch=x64"
+    if [ "$ARCH" = "amd64-freebsd" -o "$ARCH" = "amd64-freebsd-thread-multi" ]; then
+        FFOPTS="$FFOPTS --arch=x86"
+    fi
+
+    # FreeBSD amd64 needs compiler we specified (or not)
+    if [ "$OS" = "FreeBSD" ]; then
+        FFOPTS="$FFOPTS --cc=$GCC"
     fi
     
-    if [ $OS = "Darwin" ]; then
+    if [ "$OS" = "Darwin" ]; then
         SAVED_FLAGS=$FLAGS
         
         # Build 64-bit fork (10.6/10.7)
-        if [ $OSX_VER != "10.5" ]; then
+        if [ "$OSX_VER" != "10.5" ]; then
             FLAGS="-arch x86_64 -O3 -fPIC $OSX_FLAGS"      
+            CC="$GCC" CXX="$GXX" CPP="$GPP" \
             CFLAGS="$FLAGS" \
             LDFLAGS="$FLAGS" \
                 ./configure $FFOPTS --arch=x86_64
         
-            make
+            $MAKE
             if [ $? != 0 ]; then
                 echo "make failed"
                 exit $?
@@ -1470,13 +1376,14 @@ function build_ffmpeg {
         fi
         
         # Build 32-bit fork (all OSX versions)
-        make clean
+        $MAKE clean
         FLAGS="-arch i386 -O3 $OSX_FLAGS"      
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="$FLAGS" \
         LDFLAGS="$FLAGS" \
             ./configure $FFOPTS --arch=x86_32
         
-        make
+        $MAKE
         if [ $? != 0 ]; then
             echo "make failed"
             exit $?
@@ -1488,14 +1395,15 @@ function build_ffmpeg {
         cp -fv libswscale/libswscale.a libswscale-i386.a
         
         # Build PPC fork (10.5)
-        if [ $OSX_VER = "10.5" ]; then
-            make clean
+        if [ "$OSX_VER" = "10.5" ]; then
+            $MAKE clean
             FLAGS="-arch ppc -O3 $OSX_FLAGS"      
+            CC="$GCC" CXX="$GXX" CPP="$GPP" \
             CFLAGS="$FLAGS" \
             LDFLAGS="$FLAGS" \
                 ./configure $FFOPTS --arch=ppc --disable-altivec
         
-            make
+            $MAKE
             if [ $? != 0 ]; then
                 echo "make failed"
                 exit $?
@@ -1508,7 +1416,7 @@ function build_ffmpeg {
         fi
         
         # Combine the forks
-        if [ $OSX_VER = "10.5" ]; then
+        if [ "$OSX_VER" = "10.5" ]; then
             lipo -create libavcodec-i386.a libavcodec-ppc.a -output libavcodec.a
             lipo -create libavformat-i386.a libavformat-ppc.a -output libavformat.a
             lipo -create libavutil-i386.a libavutil-ppc.a -output libavutil.a
@@ -1521,7 +1429,7 @@ function build_ffmpeg {
         fi
         
         # Install and replace libs with universal versions
-        make install
+        $MAKE install
         cp -f libavcodec.a $BUILD/lib/libavcodec.a
         cp -f libavformat.a $BUILD/lib/libavformat.a
         cp -f libavutil.a $BUILD/lib/libavutil.a
@@ -1530,6 +1438,7 @@ function build_ffmpeg {
         FLAGS=$SAVED_FLAGS
         cd ..
     else           
+        CC="$GCC" CXX="$GXX" CPP="$GPP" \
         CFLAGS="$FLAGS -O3" \
         LDFLAGS="$FLAGS -O3" \
             ./configure $FFOPTS
@@ -1553,24 +1462,32 @@ function build_bdb {
     
     # --enable-posixmutexes is needed to build on ReadyNAS Sparc.
     MUTEX=""
-    if [ $MACHINE = "padre" ]; then
+    if [ "$MACHINE" = "padre" ]; then
       MUTEX="--enable-posixmutexes"
     fi
     
     # build bdb
-    tar zxvf db-5.1.25.tar.gz
+    tar_wrapper zxvf db-5.1.25.tar.gz
     cd db-5.1.25/build_unix
+    
+    if [ "$OS" = "Darwin" -o "$OS" = "FreeBSD" ]; then
+       pushd ..
+       patch -p0 < ../db51-src_dbinc_atomic.patch
+       popd
+    fi
+
+    CC="$GCC" CXX="$GXX" CPP="$GPP" \
     CFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
     LDFLAGS="$FLAGS $OSX_ARCH $OSX_FLAGS -O3" \
         ../dist/configure --prefix=$BUILD $MUTEX \
         --with-cryptography=no -disable-hash --disable-queue --disable-replication --disable-statistics --disable-verify \
         --disable-dependency-tracking --disable-shared
-    make
+    $MAKE
     if [ $? != 0 ]; then
         echo "make failed"
         exit $?
     fi
-    make install
+    $MAKE install
     cd ../..
     
     rm -rf db-5.1.25
@@ -1578,6 +1495,7 @@ function build_bdb {
 
 # Build a single module if requested, or all
 if [ $1 ]; then
+    echo "building only $1"
     build $1
 else
     build_all
@@ -1586,11 +1504,11 @@ fi
 # Reset PERL5LIB
 export PERL5LIB=
 
-if [ $OS = 'Darwin' ]; then
+if [ "$OS" = 'Darwin' ]; then
     # strip -S on all bundle files
     find $BUILD -name '*.bundle' -exec chmod u+w {} \;
     find $BUILD -name '*.bundle' -exec strip -S {} \;
-elif [ $OS = 'Linux' -o $OS = "FreeBSD" ]; then
+elif [ "$OS" = 'Linux' -o "$OS" = "FreeBSD" ]; then
     # strip all so files
     find $BUILD -name '*.so' -exec chmod u+w {} \;
     find $BUILD -name '*.so' -exec strip {} \;
@@ -1602,29 +1520,14 @@ find $BUILD -name '*.packlist' -exec rm -f {} \;
 
 # create our directory structure
 # rsync is used to avoid copying non-binary modules or other extra stuff
-if [ $PERL_58 ]; then
-    mkdir -p $BUILD/arch/5.8/$ARCH
-    rsync -amv --include='*/' --include='*.so' --include='*.bundle' --include='autosplit.ix' --exclude='*' $BASE_58/lib/perl5/*/auto $BUILD/arch/5.8/$ARCH/
-fi
-if [ $PERL_510 ]; then
-    mkdir -p $BUILD/arch/5.10/$ARCH
-    rsync -amv --include='*/' --include='*.so' --include='*.bundle' --include='autosplit.ix' --exclude='*' $BASE_510/lib/perl5/*/auto $BUILD/arch/5.10/$ARCH/
-fi
-if [ $PERL_512 ]; then
+if [ $PERL_MINOR_VER -ge 12 ]; then
     # Check for Perl using use64bitint and add -64int
-    ARCH=`$PERL_512 -MConfig -le 'print $Config{archname}' | sed 's/gnu-//' | sed 's/^i[3456]86-/i386-/' | sed 's/armv5tejl/arm/' `
-    mkdir -p $BUILD/arch/5.12/$ARCH
-    rsync -amv --include='*/' --include='*.so' --include='*.bundle' --include='autosplit.ix' --exclude='*' $BASE_512/lib/perl5/*/auto $BUILD/arch/5.12/$ARCH/
+    ARCH=`$PERL_BIN -MConfig -le 'print $Config{archname}' | sed 's/gnu-//' | sed 's/^i[3456]86-/i386-/' | sed 's/armv.*?-/arm-/' `
 fi
-if [ $PERL_514 ]; then
-    # Check for Perl using use64bitint and add -64int
-    ARCH=`$PERL_514 -MConfig -le 'print $Config{archname}' | sed 's/gnu-//' | sed 's/^i[3456]86-/i386-/' | sed 's/armv5tejl/arm/' `
-    mkdir -p $BUILD/arch/5.14/$ARCH
-    rsync -amv --include='*/' --include='*.so' --include='*.bundle' --include='autosplit.ix' --exclude='*' $BASE_514/lib/perl5/*/auto $BUILD/arch/5.14/$ARCH/
-fi
+mkdir -p $PERL_ARCH/$ARCH
+rsync -amv --include='*/' --include='*.so' --include='*.bundle' --include='autosplit.ix' --exclude='*' $PERL_BASE/lib/perl5/*/auto $PERL_ARCH/$ARCH/
 
 # could remove rest of build data, but let's leave it around in case
-#rm -rf $BASE_58
-#rm -rf $BASE_510
-#rm -rf $BASE_512
+#rm -rf $PERL_BASE
+#rm -rf $PERL_ARCH
 #rm -rf $BUILD/bin $BUILD/etc $BUILD/include $BUILD/lib $BUILD/man $BUILD/share $BUILD/var
